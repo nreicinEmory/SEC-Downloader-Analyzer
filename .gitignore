@@ -35,6 +35,10 @@ env/
 *.sublime-workspace
 *.sublime-project
 
+# Cache
+cache/
+sec_cache/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
