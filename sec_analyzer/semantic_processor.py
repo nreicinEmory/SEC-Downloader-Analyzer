@@ -335,68 +335,92 @@ def parse_amount(text: str) -> Optional[float]:
         logger.warning(f"Could not parse amount from text: {text}. Error: {str(e)}")
         return None
 
-def find_red_flags(elements: List['SemanticElement']) -> List['RedFlag']:
+def find_red_flags(elements: List['SemanticElement']) -> List[RedFlag]:
     """Find potential red flags in the filing."""
     red_flags = []
-    current_section = "Unknown Section"
+    current_section = None
     
-    # Define red flag categories and their associated terms
+    # Define red flag categories with more specific and negative indicators
     red_flag_categories = {
         'Financial Health': {
             'terms': [
-                'going concern', 'substantial doubt', 'material weakness',
-                'liquidity issues', 'debt covenant', 'default', 'bankruptcy',
-                'significant loss', 'operating loss', 'net loss'
+                'going concern',
+                'substantial doubt',
+                'material weakness',
+                'liquidity issues',
+                'insolvency',
+                'bankruptcy',
+                'default',
+                'debt covenant violation',
+                'significant losses',
+                'financial distress',
+                'negative cash flow',
+                'operating losses',
+                'declining revenue',
+                'decreasing margins'
             ],
-            'severity': 'High'
+            'context_required': False  # Changed to False to catch more potential issues
         },
         'Financial Reporting': {
             'terms': [
-                'restatement', 'material error', 'accounting error',
-                'internal control', 'audit issues', 'disagreement with auditor',
-                'material weakness', 'significant deficiency'
+                'material misstatement',
+                'accounting fraud',
+                'restatement required',
+                'internal control failure',
+                'audit qualification',
+                'material weakness in controls',
+                'significant deficiency',
+                'accounting error',
+                'financial restatement',
+                'control deficiency'
             ],
-            'severity': 'High'
+            'context_required': False
         },
         'Management and Governance': {
             'terms': [
-                'ceo change', 'cfo change', 'management change',
-                'related party transaction', 'conflict of interest',
-                'executive compensation', 'board changes'
+                'ceo resignation',
+                'cfo resignation',
+                'board resignation',
+                'fraudulent activity',
+                'misconduct',
+                'conflict of interest',
+                'regulatory violation',
+                'insider trading',
+                'executive departure',
+                'management change',
+                'governance issues'
             ],
-            'severity': 'Medium'
+            'context_required': False
         },
         'Operational': {
             'terms': [
-                'supply chain disruption', 'cyber attack', 'data breach',
-                'operational disruption', 'production issues',
-                'quality control issues', 'recall'
+                'major disruption',
+                'critical failure',
+                'significant downtime',
+                'catastrophic event',
+                'severe impact',
+                'material adverse effect',
+                'business interruption',
+                'supply chain disruption',
+                'operational issues',
+                'production problems'
             ],
-            'severity': 'Medium'
+            'context_required': False
         },
         'Legal and Regulatory': {
             'terms': [
-                'regulatory investigation', 'enforcement action',
-                'legal proceedings', 'lawsuit', 'class action',
-                'regulatory compliance', 'fines', 'penalties'
+                'regulatory investigation',
+                'enforcement action',
+                'class action lawsuit',
+                'material litigation',
+                'regulatory penalty',
+                'compliance failure',
+                'significant fine',
+                'legal proceedings',
+                'regulatory scrutiny',
+                'compliance issues'
             ],
-            'severity': 'High'
-        },
-        'Market and Competition': {
-            'terms': [
-                'market share decline', 'pricing pressure',
-                'competitive pressure', 'market disruption',
-                'customer loss', 'key customer'
-            ],
-            'severity': 'Medium'
-        },
-        'Innovation and Growth': {
-            'terms': [
-                'product delay', 'patent expiration',
-                'intellectual property', 'research setback',
-                'development delay', 'technology risk'
-            ],
-            'severity': 'Medium'
+            'context_required': False
         }
     }
     
@@ -410,28 +434,53 @@ def find_red_flags(elements: List['SemanticElement']) -> List['RedFlag']:
             continue
             
         # Get the text content
-        text = element.content.get_text().lower()
+        try:
+            text = element.content.get_text().strip().lower()
+            if not text:
+                continue
+        except Exception as e:
+            logger.warning(f"Error getting text from element: {str(e)}")
+            continue
         
         # Check each category
-        for category, info in red_flag_categories.items():
-            for term in info['terms']:
+        for category, config in red_flag_categories.items():
+            for term in config['terms']:
                 if term in text:
-                    # Get a snippet of the context
-                    start_idx = max(0, text.find(term) - 50)
-                    end_idx = min(len(text), text.find(term) + len(term) + 50)
-                    context = text[start_idx:end_idx].strip()
+                    # Get context (surrounding sentences)
+                    sentences = text.split('.')
+                    context_sentences = []
+                    for sentence in sentences:
+                        if term in sentence:
+                            context_sentences.append(sentence.strip())
                     
-                    # Clean up the section name
-                    section_name = current_section.replace('\n', ' ').strip()
-                    if len(section_name) > 50:
-                        section_name = section_name[:47] + "..."
+                    if not context_sentences and config['context_required']:
+                        continue
                     
+                    # Determine severity based on context
+                    severity = 'Medium'
+                    context_text = ' '.join(context_sentences)
+                    
+                    # High severity indicators
+                    high_severity_terms = [
+                        'material', 'significant', 'substantial', 'critical',
+                        'severe', 'major', 'catastrophic', 'fraud', 'bankruptcy',
+                        'insolvency', 'going concern', 'restatement'
+                    ]
+                    
+                    if any(word in context_text for word in high_severity_terms):
+                        severity = 'High'
+                    
+                    # Create the red flag
                     red_flags.append(RedFlag(
                         category=category,
-                        description=f"Found '{term}' in {section_name}",
-                        severity=info['severity'],
-                        context=context
+                        description=f"Found '{term}' in {current_section or 'unknown section'}",
+                        severity=severity,
+                        context=context_text
                     ))
+                    logger.info(f"Found red flag: {category} - {term} - {severity}")
+    
+    # Sort red flags by severity (High first, then Medium)
+    red_flags.sort(key=lambda x: 0 if x.severity == 'High' else 1)
     
     return red_flags
 
