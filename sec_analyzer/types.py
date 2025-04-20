@@ -11,6 +11,7 @@ class SemanticElement:
     """Represents a semantic element in a document."""
     type: str
     content: Any
+    text: str = ""
     parent: Optional['SemanticElement'] = None
 
 @dataclass

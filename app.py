@@ -48,11 +48,53 @@ if st.button("Get Filing"):
                         delta=None
                     )
             
-            # Display red flags
-            st.header("Red Flags")
-            for flag in result['red_flags']:
-                with st.expander(f"{flag.category} - {flag.description} ({flag.severity})"):
-                    st.write(flag.context)
+            # Display legal red flags
+            st.header("Legal Proceedings Analysis")
+            if result['legal_red_flags']:
+                # Display summary analysis
+                st.subheader("Summary Analysis")
+                for category_summary in result['legal_summary']:
+                    with st.expander(f"{category_summary['category']} - {category_summary['high_severity_count']} High Severity, {category_summary['medium_severity_count']} Medium Severity Issues"):
+                        for flag in category_summary['flags']:
+                            st.write(f"**{flag.severity} Severity**: {flag.context}")
+                
+                # Display detailed analysis
+                st.subheader("Detailed Analysis")
+                for flag in result['legal_red_flags']:
+                    with st.expander(f"{flag.category} - {flag.description} ({flag.severity})"):
+                        st.write(flag.context)
+            else:
+                st.warning("No legal red flags were detected. This could be because:")
+                st.write("- The Legal Proceedings section was not found in the document")
+                st.write("- The section was found but no red flags were identified")
+                st.write("- There was an error processing the document")
+            
+            # Display MD&A insights
+            st.header("Management Discussion & Analysis")
+            if result['mda_insights']:
+                # Display summary analysis
+                st.subheader("Summary Analysis")
+                for category_summary in result['mda_summary']:
+                    with st.expander(f"{category_summary['category']} - {category_summary['high_significance_count']} High Significance, {category_summary['medium_significance_count']} Medium Significance Points"):
+                        for insight in category_summary['insights']:
+                            st.write(f"**{insight.severity} Significance**: {insight.context}")
+                
+                # Display detailed analysis
+                st.subheader("Detailed Analysis")
+                for insight in result['mda_insights']:
+                    with st.expander(f"{insight.category} - {insight.description} ({insight.severity})"):
+                        st.write(insight.context)
+            else:
+                st.warning("No MD&A insights were detected. This could be because:")
+                st.write("- The MD&A section was not found in the document")
+                st.write("- The section was found but no significant insights were identified")
+                st.write("- There was an error processing the document")
+                
+                # Debug information
+                st.subheader("Debug Information")
+                st.write("Number of elements processed:", len(result['elements']))
+                st.write("MD&A insights found:", len(result['mda_insights']))
+                st.write("Summary analysis items:", len(result['mda_summary']))
             
             # Display company focus analysis
             st.header("Company Focus Analysis")
