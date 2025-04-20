@@ -4,10 +4,11 @@ Module for processing SEC filings into sections and extracting key information.
 
 import re
 import logging
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from typing import Dict, List, Optional, Any, Tuple
 from .parsing.parsers import SEC10KParser, SEC10QParser
 from .types import FinancialMetric, RedFlag, SemanticElement
+import streamlit as st
 
 # Configure logging
 logging.basicConfig(
@@ -16,6 +17,99 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def parse_table_of_contents(soup: BeautifulSoup) -> List[Dict]:
+    """Parse the table of contents and document content to create a hierarchical structure."""
+    logger.info("Starting table of contents parsing")
+    structure = []
+    
+    # Find the table of contents section
+    toc_pattern = re.compile(r'table\s+of\s+contents', re.IGNORECASE)
+    toc_section = None
+    
+    # Look for the table of contents in various possible locations
+    for element in soup.find_all(['h1', 'h2', 'h3', 'div']):
+        if toc_pattern.search(element.get_text()):
+            toc_section = element
+            break
+    
+    if not toc_section:
+        logger.warning("Could not find table of contents section")
+        return []
+    
+    # Find all items in the table of contents
+    current_part = None
+    current_items = []
+    
+    # Look for items in the table of contents
+    for element in toc_section.find_all_next(['h1', 'h2', 'h3', 'div', 'p']):
+        text = element.get_text().strip()
+        
+        # Check if this is a part header
+        if re.match(r'^part\s+[iIvV]+$', text, re.IGNORECASE):
+            # If we have a current part, add it to the structure
+            if current_part and current_items:
+                structure.append({
+                    'title': current_part,
+                    'items': current_items
+                })
+            current_part = text.upper()
+            current_items = []
+            continue
+        
+        # Check if this is an item
+        item_match = re.match(r'^item\s+(\d+[A-Z]?)\s*\.?\s*(.*)$', text, re.IGNORECASE)
+        if item_match:
+            item_number = item_match.group(1)
+            item_title = item_match.group(2).strip()
+            
+            # Handle reserved items
+            if item_title.lower() == 'reserved':
+                # If this is Item 6, it's the start of Part II
+                if item_number == '6':
+                    if current_part and current_items:
+                        structure.append({
+                            'title': current_part,
+                            'items': current_items
+                        })
+                    current_part = 'PART II'
+                    current_items = []
+                continue
+            
+            # Skip items with no title or just numbers
+            if not item_title or re.match(r'^\d+[A-Z]?\s*$', item_title):
+                continue
+            
+            # Skip items that are just numbers separated by commas
+            if re.match(r'^\d+[A-Z]?\s*,\s*\d+[A-Z]?\s*$', item_title):
+                continue
+            
+            # Add the item with its full title
+            current_items.append({
+                'title': f"Item {item_number}. {item_title}",
+                'item_number': item_number
+            })
+        
+        # Stop if we hit the next major section
+        if element.name in ['h1', 'h2'] and not re.match(r'^part\s+[iIvV]+$', text, re.IGNORECASE):
+            break
+    
+    # Add the last part if it exists
+    if current_part and current_items:
+        structure.append({
+            'title': current_part,
+            'items': current_items
+        })
+    
+    # Now find the content for each item
+    for part in structure:
+        for item in part['items']:
+            section_content = find_section_content(soup, item['title'])
+            item['content'] = section_content['content']
+            item['subsections'] = section_content['subsections']
+    
+    logger.info(f"Completed table of contents parsing. Created structure with {len(structure)} parts")
+    return structure
+
 def process_html(html_content: str, form_type: str = '10-K') -> Dict[str, Any]:
     """Process HTML content and extract key information."""
     logger.info("Starting HTML processing")
@@ -23,37 +117,13 @@ def process_html(html_content: str, form_type: str = '10-K') -> Dict[str, Any]:
     # Parse HTML
     soup = BeautifulSoup(html_content, 'html.parser')
     
-    # Check if this is an XBRL document
-    is_xbrl = bool(soup.find(['ix:nonnumeric', 'ix:numeric', 'ix:hidden']))
-    
-    if is_xbrl:
-        logger.info("Detected XBRL document, using specialized parsing")
-        # For XBRL documents, we need to look for the actual filing text
-        # The filing text is typically in a div with class 'document'
-        filing_text = soup.find('div', class_='document')
-        if filing_text:
-            soup = BeautifulSoup(str(filing_text), 'html.parser')
-        else:
-            logger.warning("Could not find filing text in XBRL document")
-    
-    # Debug: Print the first few elements to see structure
-    logger.info("HTML Structure Preview:")
-    for element in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div'])[:5]:
-        text = element.get_text().strip()
-        if text:  # Only log non-empty elements
-            logger.info(f"Element: {element.name}, Text: {text[:100]}...")
-    
-    # Create semantic elements
+    # First pass: Extract all semantic elements
     elements = []
-    
-    # Process all text content
-    for element in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div']):
-        # Skip empty elements
+    for element in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div', 'table']):
         text = element.get_text().strip()
         if not text:
             continue
             
-        # Determine element type
         if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
             element_type = 'heading'
         elif element.name == 'table':
@@ -61,50 +131,99 @@ def process_html(html_content: str, form_type: str = '10-K') -> Dict[str, Any]:
         else:
             element_type = 'text'
             
-        # Create semantic element with cleaned text
         elements.append(SemanticElement(
             type=element_type,
             content=element,
-            text=text  # Set the text attribute
+            text=text
         ))
     
-    logger.info(f"Parsed {len(elements)} semantic elements")
+    # Create document structure using the extracted elements
+    document_structure = create_document_structure(elements)
     
-    try:
-        # Extract financial data
-        financial_data = extract_financial_data(elements)
-        print('financial_data', financial_data)
+    # Extract other information using the same elements
+    financial_data = extract_financial_data(elements)
+    legal_red_flags, legal_summary = find_legal_red_flags(elements)
+    mda_insights, mda_summary = find_mda_insights(elements)
+    focus_analysis = analyze_company_focus(elements)
+    
+    result = {
+        'document_structure': document_structure,
+        'metrics': financial_data['metrics'],
+        'ratios': financial_data['ratios'],
+        'legal_red_flags': legal_red_flags,
+        'legal_summary': legal_summary,
+        'mda_insights': mda_insights,
+        'mda_summary': mda_summary,
+        'focus_analysis': focus_analysis
+    }
+    
+    return result
+
+def create_document_structure(elements: List['SemanticElement']) -> List[Dict]:
+    """Create a nested structure of the document using the processed elements."""
+    structure = []
+    current_part = None
+    current_items = []
+    
+    for element in elements:
+        # Skip navigation elements
+        if any(marker in element.text.lower() for marker in ['table of contents', 'next page', 'previous page']):
+            continue
         
-        # Find legal-specific red flags
-        legal_red_flags, legal_summary = find_legal_red_flags(elements)
-        logger.info(f"Found {len(legal_red_flags)} legal red flags")
-        logger.info(f"Legal summary contains {len(legal_summary)} categories")
+        # Check if this is a part header
+        if re.match(r'^part\s+[iIvV]+$', element.text, re.IGNORECASE):
+            if current_part and current_items:
+                structure.append({
+                    'title': current_part,
+                    'items': current_items
+                })
+            current_part = element.text.upper()
+            current_items = []
+            continue
         
-        # Find MD&A insights
-        mda_insights, mda_summary = find_mda_insights(elements)
-        logger.info(f"Found {len(mda_insights)} MD&A insights")
-        logger.info(f"MD&A summary contains {len(mda_summary)} categories")
+        # Check if this is an item header
+        item_match = re.match(r'^item\s+(\d+[A-Z]?)\s*\.?\s*(.*)$', element.text, re.IGNORECASE)
+        if item_match:
+            item_number = item_match.group(1)
+            item_title = item_match.group(2).strip()
+            
+            # Handle reserved items
+            if item_title.lower() == 'reserved':
+                # If this is Item 6, it's the start of Part II
+                if item_number == '6':
+                    if current_part and current_items:
+                        structure.append({
+                            'title': current_part,
+                            'items': current_items
+                        })
+                    current_part = 'PART II'
+                    current_items = []
+                continue
+            
+            if item_title:  # Only add if we have a title
+                current_items.append({
+                    'title': f"Item {item_number}. {item_title}",
+                    'item_number': item_number,
+                    'content': [],
+                    'subsections': []
+                })
         
-        # Analyze company focus
-        focus_analysis = analyze_company_focus(elements)
-        
-        result = {
-            'elements': elements,
-            'metrics': financial_data['metrics'],
-            'ratios': financial_data['ratios'],
-            'legal_red_flags': legal_red_flags,
-            'legal_summary': legal_summary,
-            'mda_insights': mda_insights,
-            'mda_summary': mda_summary,
-            'focus_analysis': focus_analysis
-        }
-        
-        logger.info("HTML processing completed successfully")
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error processing HTML: {str(e)}", exc_info=True)
-        raise
+        # Handle content for the current item
+        elif current_items and element.type in ['text', 'table']:
+            content = {
+                'type': element.type,
+                'content': element.text if element.type == 'text' else element.content
+            }
+            current_items[-1]['content'].append(content)
+    
+    # Add the last part if it exists
+    if current_part and current_items:
+        structure.append({
+            'title': current_part,
+            'items': current_items
+        })
+    
+    return structure
 
 def extract_section_content(element) -> str:
     """Extract content from a section element."""
@@ -366,6 +485,7 @@ def parse_amount(text: str) -> Optional[float]:
     except ValueError as e:
         logger.warning(f"Could not parse amount from text: {text}. Error: {str(e)}")
         return None
+
 
 def find_legal_red_flags(elements: List['SemanticElement']) -> Tuple[List[RedFlag], List[Dict]]:
     """Find legal red flags in the filing."""
@@ -831,4 +951,231 @@ def analyze_company_focus(elements: List['SemanticElement']) -> Dict[str, Any]:
         'focus_areas': focus_analysis,
         'top_terms': top_terms,
         'total_words': len(tokens)
-    } 
+    }
+
+def display_document_structure(structure):
+    """Display the document structure using Streamlit's native components."""
+    logger.info("Starting document structure display")
+    
+    if not structure:
+        logger.warning("No document structure to display")
+        st.warning("No document structure found")
+        return
+    
+    # Group parts by their title to avoid duplicates
+    grouped_parts = {}
+    for part in structure:
+        if part['title'] not in grouped_parts:
+            grouped_parts[part['title']] = {
+                'title': part['title'],
+                'items': []
+            }
+        grouped_parts[part['title']]['items'].extend(part['items'])
+    
+    # Create tabs for each unique part
+    part_tabs = st.tabs([part['title'] for part in grouped_parts.values()])
+    
+    for part_tab, part in zip(part_tabs, grouped_parts.values()):
+        with part_tab:
+            # Display items in a single column for better readability
+            for item in part['items']:
+                with st.expander(f"📄 {item['title']}", expanded=False):
+                    # Display main content if any
+                    if item['content']:
+                        for content in item['content']:
+                            if isinstance(content, dict) and content['type'] == 'text':
+                                st.write(content['content'])
+                                st.write("")  # Add spacing between paragraphs
+                    
+                    # Display subsections if any
+                    if item['subsections']:
+                        for subsection in item['subsections']:
+                            with st.expander(f"📑 {subsection['title']}", expanded=False):
+                                # Add indentation for subsection content
+                                for content in subsection['content']:
+                                    if isinstance(content, dict) and content['type'] == 'text':
+                                        st.write("&nbsp;&nbsp;&nbsp;&nbsp;" + content['content'])
+                                        st.write("")  # Add spacing between paragraphs
+                    
+                    if not item['content'] and not item['subsections']:
+                        st.info("No content available for this section")
+
+def find_section_content(soup: BeautifulSoup, section_title: str) -> Dict:
+    """Find the content and subsections of a given section using regex patterns."""
+    logger.info(f"Finding content for section: {section_title}")
+    content = []
+    subsections = []
+    
+    # Get the full HTML content
+    html_content = str(soup)
+    
+    # Create regex pattern for the section
+    # Handle both formats: "Item X. Title" and just "Title"
+    if 'Item' in section_title:
+        item_number = re.search(r'Item\s+(\d+[A-Z]?)', section_title)
+        if item_number:
+            # Pattern for "Item X. Title" format
+            pattern = re.compile(
+                rf'Item\s+{item_number.group(1)}\s*\.?\s*{re.escape(section_title.split(".", 1)[1].strip())}',
+                re.IGNORECASE | re.MULTILINE
+            )
+    else:
+        # Pattern for just the title
+        pattern = re.compile(re.escape(section_title), re.IGNORECASE | re.MULTILINE)
+    
+    # Find the section start
+    section_match = pattern.search(html_content)
+    if not section_match:
+        logger.warning(f"Could not find section header for: {section_title}")
+        return {'content': [], 'subsections': []}
+    
+    # Find the next section start (look for next Item X pattern)
+    next_section_pattern = re.compile(r'Item\s+\d+[A-Z]?\s*\.', re.IGNORECASE | re.MULTILINE)
+    next_section_match = next_section_pattern.search(html_content, section_match.end())
+    
+    # Extract content between current section and next section
+    if next_section_match:
+        section_content = html_content[section_match.start():next_section_match.start()]
+    else:
+        section_content = html_content[section_match.start():]
+    
+    # Parse the section content with BeautifulSoup
+    section_soup = BeautifulSoup(section_content, 'html.parser')
+    
+    # First, try to find the main content div
+    main_content = None
+    for div in section_soup.find_all('div'):
+        if 'class' in div.attrs and any(cls in div['class'] for cls in ['content', 'text', 'main']):
+            main_content = div
+            break
+    
+    # If we found a main content div, use that
+    if main_content:
+        section_soup = main_content
+    
+    # Extract all text elements
+    current_subsection = None
+    
+    # Process all elements in order
+    for element in section_soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div']):
+        # Skip navigation elements and page headings
+        if any(marker in element.get_text().lower() for marker in [
+            'table of contents', 'next page', 'previous page',
+            'form 10-k', 'form 10-q', 'form 8-k', '|', 'page'
+        ]):
+            continue
+        
+        # Get the text content
+        text = element.get_text(strip=True)
+        if not text:
+            continue
+        
+        # Skip very short text that's likely just formatting
+        if len(text.split()) < 3:
+            continue
+        
+        # Check if this is a subsection header
+        is_subsection = (
+            element.name in ['h3', 'h4', 'h5', 'h6'] or
+            (len(text.split()) <= 6 and text.endswith(':')) or
+            re.match(r'^[A-Z][A-Za-z\s]{2,}[.:]', text) or
+            re.match(r'^[A-Z][A-Za-z\s]{2,}\s*$', text)  # Also match headers without punctuation
+        )
+        
+        if is_subsection:
+            # If we have a current subsection, add it to subsections
+            if current_subsection and current_subsection['content']:
+                subsections.append(current_subsection)
+            
+            # Start a new subsection
+            current_subsection = {
+                'title': text,
+                'content': []
+            }
+        else:
+            # Skip common elements we don't want
+            if not any(skip in text.lower() for skip in [
+                'forward-looking statement',
+                'table of contents',
+                'documents incorporated by reference',
+                'part ii',
+                'part iii',
+                'part iv'
+            ]):
+                # Clean up the text
+                text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+                text = text.strip()
+                
+                # Add as regular text content
+                text_content = {
+                    'type': 'text',
+                    'content': text
+                }
+                
+                if current_subsection:
+                    current_subsection['content'].append(text_content)
+                else:
+                    content.append(text_content)
+    
+    # Add the last subsection if it exists
+    if current_subsection and current_subsection['content']:
+        subsections.append(current_subsection)
+    
+    # Clean up content
+    content = clean_content(content)
+    subsections = clean_subsections(subsections)
+    
+    # If we found no content, try a more aggressive approach
+    if not content and not subsections:
+        logger.info("No content found with standard approach, trying aggressive extraction")
+        # Try to find the section by looking for the title in the HTML
+        section_elements = section_soup.find_all(['p', 'div'])
+        for element in section_elements:
+            text = element.get_text(strip=True)
+            if text and len(text.split()) > 3:
+                content.append({
+                    'type': 'text',
+                    'content': text
+                })
+    
+    return {
+        'content': content,
+        'subsections': subsections
+    }
+
+def clean_content(content: List[str]) -> List[str]:
+    """Clean and deduplicate content."""
+    # Remove very short or empty content
+    content = [c for c in content if len(c.split()) > 3]
+    
+    # Remove duplicate paragraphs
+    unique_content = []
+    seen = set()
+    for c in content:
+        # Normalize text for comparison
+        normalized = ' '.join(c.split())
+        if normalized not in seen:
+            seen.add(normalized)
+            unique_content.append(c)
+    
+    return unique_content
+
+def clean_subsections(subsections: List[Dict]) -> List[Dict]:
+    """Clean and deduplicate subsections."""
+    cleaned = []
+    seen_titles = set()
+    
+    for subsection in subsections:
+        # Skip empty subsections
+        if not subsection['content']:
+            continue
+        
+        # Normalize title
+        title = ' '.join(subsection['title'].split())
+        if title not in seen_titles:
+            seen_titles.add(title)
+            subsection['content'] = clean_content(subsection['content'])
+            if subsection['content']:  # Only add if there's content after cleaning
+                cleaned.append(subsection)
+    
+    return cleaned 

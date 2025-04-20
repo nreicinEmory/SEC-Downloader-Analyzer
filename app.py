@@ -4,7 +4,7 @@ Streamlit app for SEC filing analysis.
 
 import streamlit as st
 from sec_analyzer.downloader import download_filing
-from sec_analyzer.semantic_processor import process_html, analyze_company_focus
+from sec_analyzer.semantic_processor import process_html, analyze_company_focus, display_document_structure
 import plotly.express as px
 import pandas as pd
 
@@ -126,11 +126,29 @@ if st.button("Get Filing"):
             
             # Display document structure
             st.header("Document Structure")
-            for element in result['elements']:
-                if element.type == 'heading':
-                    st.subheader(element.content.get_text())
-                elif element.type == 'text':
-                    st.write(element.content.get_text())
+            display_document_structure(result['document_structure'])
             
         except Exception as e:
-            st.error(f"Error processing filing: {str(e)}") 
+            st.error(f"Error processing filing: {str(e)}")
+
+def display_document_structure(structure):
+    """Display the document structure using nested expanders."""
+    for section in structure:
+        # Display Section
+        with st.expander(f"📑 {section['title']} ({section['type']})", expanded=False):
+            # Display section content if any
+            if section['content']:
+                for content in section['content']:
+                    if content['type'] == 'table':
+                        st.write(content['content'])
+                    else:
+                        st.write(content['content'])
+            
+            # Display Subsections
+            for subsection in section['subsections']:
+                with st.expander(f"📄 {subsection['title']}", expanded=False):
+                    for content in subsection['content']:
+                        if content['type'] == 'table':
+                            st.write(content['content'])
+                        else:
+                            st.write(content['content']) 
