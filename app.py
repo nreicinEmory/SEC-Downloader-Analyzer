@@ -5,7 +5,14 @@ Streamlit app for SEC filing analysis.
 import streamlit as st
 from sec_analyzer.downloader import download_filing
 from sec_analyzer.semantic_processor import process_html, analyze_company_focus, display_document_structure
-from sec_analyzer.fin_ratios import get_financial_ratios, get_financial_metrics
+from sec_analyzer.fin_ratios import (
+    get_financial_ratios, 
+    get_financial_metrics,
+    analyze_balance_sheet_yoy,
+    analyze_income_statement_yoy,
+    analyze_cash_flow_yoy,
+    format_yoy_changes
+)
 import plotly.express as px
 import pandas as pd
 
@@ -94,16 +101,55 @@ if st.button("Get Filing"):
             with st.expander("📊 Balance Sheet", expanded=False):
                 balance_sheet_formatted = format_financial_data(balance_sheet_df)
                 st.dataframe(balance_sheet_formatted, use_container_width=True, hide_index=True)
+                
+                # Add Year-over-Year Analysis
+                st.subheader("Year-over-Year Changes")
+                yoy_changes = analyze_balance_sheet_yoy(ticker)
+                yoy_formatted = format_yoy_changes(yoy_changes)
+                
+                # Apply color coding to the DataFrame
+                def color_negative_red(val):
+                    if isinstance(val, str) and val != "N/A" and val != "Year Comparison":
+                        try:
+                            value = float(val.strip('%'))
+                            color = 'red' if value < 0 else 'green'
+                            return f'color: {color}'
+                        except ValueError:
+                            return ''
+                    return ''
+                
+                # Apply styling only to numeric columns
+                styled_df = yoy_formatted.style.applymap(color_negative_red, subset=yoy_formatted.columns[1:])
+                
+                st.dataframe(
+                    styled_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
             
             # Display Income Statement in an expander
             with st.expander("📈 Income Statement", expanded=False):
                 income_statement_formatted = format_financial_data(income_statement_df)
                 st.dataframe(income_statement_formatted, use_container_width=True, hide_index=True)
+                
+                # Add Year-over-Year Analysis
+                st.subheader("Year-over-Year Changes")
+                yoy_changes = analyze_income_statement_yoy(ticker)
+                yoy_formatted = format_yoy_changes(yoy_changes)
+                styled_df = yoy_formatted.style.applymap(color_negative_red, subset=yoy_formatted.columns[1:])
+                st.dataframe(styled_df, use_container_width=True, hide_index=True)
             
             # Display Cash Flow in an expander
             with st.expander("💰 Cash Flow", expanded=False):
                 cash_flow_formatted = format_financial_data(cash_flow_df)
                 st.dataframe(cash_flow_formatted, use_container_width=True, hide_index=True)
+                
+                # Add Year-over-Year Analysis
+                st.subheader("Year-over-Year Changes")
+                yoy_changes = analyze_cash_flow_yoy(ticker)
+                yoy_formatted = format_yoy_changes(yoy_changes)
+                styled_df = yoy_formatted.style.applymap(color_negative_red, subset=yoy_formatted.columns[1:])
+                st.dataframe(styled_df, use_container_width=True, hide_index=True)
             
             # Display financial ratios
             st.header("Financial Ratios")
