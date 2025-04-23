@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from .parsing.parsers import SEC10KParser, SEC10QParser
 from .types import FinancialMetric, RedFlag, SemanticElement
 import streamlit as st
+from textblob import TextBlob
 
 # Configure logging
 logging.basicConfig(
@@ -17,7 +18,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def parse_table_of_contents(soup: BeautifulSoup) -> List[Dict]:
+def parse_table_of_contents(elements: List['SemanticElement']) -> List[Dict]:
     """Parse the table of contents and document content to create a hierarchical structure."""
     logger.info("Starting table of contents parsing")
     structure = []
@@ -27,8 +28,8 @@ def parse_table_of_contents(soup: BeautifulSoup) -> List[Dict]:
     toc_section = None
     
     # Look for the table of contents in various possible locations
-    for element in soup.find_all(['h1', 'h2', 'h3', 'div']):
-        if toc_pattern.search(element.get_text()):
+    for element in elements:
+        if element.type in ['heading', 'text'] and toc_pattern.search(element.text):
             toc_section = element
             break
     
@@ -41,8 +42,8 @@ def parse_table_of_contents(soup: BeautifulSoup) -> List[Dict]:
     current_items = []
     
     # Look for items in the table of contents
-    for element in toc_section.find_all_next(['h1', 'h2', 'h3', 'div', 'p']):
-        text = element.get_text().strip()
+    for element in elements:
+        text = element.text.strip()
         
         # Check if this is a part header
         if re.match(r'^part\s+[iIvV]+$', text, re.IGNORECASE):
@@ -90,7 +91,7 @@ def parse_table_of_contents(soup: BeautifulSoup) -> List[Dict]:
             })
         
         # Stop if we hit the next major section
-        if element.name in ['h1', 'h2'] and not re.match(r'^part\s+[iIvV]+$', text, re.IGNORECASE):
+        if element.type == 'heading' and not re.match(r'^part\s+[iIvV]+$', text, re.IGNORECASE):
             break
     
     # Add the last part if it exists
@@ -103,7 +104,7 @@ def parse_table_of_contents(soup: BeautifulSoup) -> List[Dict]:
     # Now find the content for each item
     for part in structure:
         for item in part['items']:
-            section_content = find_section_content(soup, item['title'])
+            section_content = find_section_content(elements, item['title'])
             item['content'] = section_content['content']
             item['subsections'] = section_content['subsections']
     
@@ -142,18 +143,15 @@ def process_html(html_content: str, form_type: str = '10-K') -> Dict[str, Any]:
     
     # Extract other information using the same elements
     financial_data = extract_financial_data(elements)
-    legal_red_flags, legal_summary = find_legal_red_flags(elements)
-    mda_insights, mda_summary = find_mda_insights(elements)
+    risks, risk_summary = analyze_company_risks(elements)
     focus_analysis = analyze_company_focus(elements)
     
     result = {
         'document_structure': document_structure,
         'metrics': financial_data['metrics'],
         'ratios': financial_data['ratios'],
-        'legal_red_flags': legal_red_flags,
-        'legal_summary': legal_summary,
-        'mda_insights': mda_insights,
-        'mda_summary': mda_summary,
+        'risks': risks,
+        'risk_summary': risk_summary,
         'focus_analysis': focus_analysis
     }
     
@@ -486,292 +484,209 @@ def parse_amount(text: str) -> Optional[float]:
         logger.warning(f"Could not parse amount from text: {text}. Error: {str(e)}")
         return None
 
-
-def find_legal_red_flags(elements: List['SemanticElement']) -> Tuple[List[RedFlag], List[Dict]]:
-    """Find legal red flags in the filing."""
-    legal_red_flags = []
-    current_section = None
-    current_paragraph = []
-    in_legal_section = False
-    
-    # Track processed contexts to avoid duplicates
-    processed_contexts = []  # Changed from set to list to allow substring checking
-    
-    # Define legal red flag categories with more specific indicators
-    legal_categories = {
-        'Commercial Litigation': {
-            'terms': [
-                'lawsuit', 'litigation', 'legal proceeding', 'legal action',
-                'class action', 'breach of contract', 'dispute', 'arbitration',
-                'settlement', 'judgment', 'court order', 'trial', 'appeal',
-                'complaint', 'defendant', 'plaintiff', 'damages', 'injunction',
-                'motion to dismiss', 'summary judgment'
-            ],
-            'context_required': True
-        },
-        'Regulatory Investigations': {
-            'terms': [
-                'regulatory investigation', 'enforcement action', 'regulatory inquiry',
-                'regulatory review', 'regulatory scrutiny', 'regulatory violation',
-                'compliance issue', 'regulatory penalty', 'regulatory fine',
-                'regulatory settlement', 'regulatory order', 'regulatory finding',
-                'regulatory action', 'regulatory proceeding', 'regulatory matter'
-            ],
-            'context_required': True
-        },
-        'Antitrust Litigation': {
-            'terms': [
-                'antitrust', 'monopoly', 'market power', 'competition law',
-                'anti-competitive', 'market dominance', 'unfair competition',
-                'price fixing', 'market allocation', 'tying arrangement',
-                'exclusive dealing', 'predatory pricing', 'merger challenge',
-                'competition authority', 'competition commission'
-            ],
-            'context_required': True
-        },
-        'Intellectual Property': {
-            'terms': [
-                'patent infringement', 'trademark infringement', 'copyright infringement',
-                'intellectual property', 'IP dispute', 'trade secret',
-                'patent litigation', 'trademark litigation', 'copyright litigation',
-                'IP litigation', 'patent claim', 'trademark claim', 'copyright claim',
-                'patent dispute', 'trademark dispute', 'copyright dispute'
-            ],
-            'context_required': True
-        },
-        'Employment Litigation': {
-            'terms': [
-                'employment dispute', 'labor dispute', 'wage and hour',
-                'discrimination', 'harassment', 'wrongful termination',
-                'employment claim', 'labor claim', 'wage claim',
-                'discrimination claim', 'harassment claim', 'wrongful termination claim',
-                'employment lawsuit', 'labor lawsuit', 'wage lawsuit'
-            ],
-            'context_required': True
-        }
-    }
-    
-    # Section header patterns to ignore
-    section_header_patterns = [
-        r'^item\s*\d+\.?\s*legal\s+proceedings',
-        r'^legal\s+proceedings',
-        r'^other\s+legal\s+proceedings',
-        r'^legal\s+matters',
-        r'^litigation',
-        r'^legal',
-        r'^part\s+\d+',
-        r'^item\s+\d+'
-    ]
-    
-    # Legal section indicators - used to identify the Legal Proceedings section
-    legal_section_indicators = [
-        'lawsuit', 'litigation', 'legal proceeding', 'legal action',
-        'court', 'judge', 'judgment', 'complaint', 'defendant', 'plaintiff',
-        'arbitration', 'settlement', 'investigation', 'enforcement',
-        'regulatory', 'antitrust', 'patent', 'trademark', 'copyright',
-        'employment', 'labor', 'wage', 'discrimination', 'harassment'
-    ]
-    
-    def is_section_header(text: str) -> bool:
-        """Check if the text matches any section header patterns."""
-        text = text.lower().strip()
-        return any(re.match(pattern, text) for pattern in section_header_patterns)
-    
-    def normalize_text(text: str) -> str:
-        """Normalize text for comparison by removing extra whitespace and punctuation."""
-        # Convert to lowercase and remove extra whitespace
-        text = ' '.join(text.lower().split())
-        # Remove punctuation except periods (to preserve sentence boundaries)
-        text = re.sub(r'[^\w\s\.]', '', text)
-        return text
-    
-    def is_duplicate_or_contained(new_text: str, existing_texts: List[str]) -> bool:
-        """Check if the new text is a duplicate or is contained within any existing text."""
-        normalized_new = normalize_text(new_text)
-        for existing in existing_texts:
-            normalized_existing = normalize_text(existing)
-            if normalized_new in normalized_existing or normalized_existing in normalized_new:
-                return True
-        return False
-    
-    for element in elements:
-        if not element.content:
-            continue
-            
-        # Get the text content
-        try:
-            text = element.text.strip()
-            if not text:
-                continue
-                
-            # Skip if this is a section header
-            if is_section_header(text):
-                if element.type == 'heading':
-                    in_legal_section = True  # Mark that we're entering the legal section
-                continue
-                
-            text_lower = text.lower()
-            
-        except Exception as e:
-            logger.warning(f"Error getting text from element: {str(e)}")
-            continue
-            
-        # Check if we're in the Legal Proceedings section
-        if not in_legal_section:
-            # Count legal indicators in the text
-            legal_indicator_count = sum(1 for indicator in legal_section_indicators if indicator in text_lower)
-            if legal_indicator_count >= 3:  # Require multiple indicators to avoid false positives
-                in_legal_section = True
-                logger.info(f"Entered Legal Proceedings section based on content: {text[:100]}...")
-            else:
-                continue
-        
-        # Add text to current paragraph if it's not a section header
-        if not is_section_header(text):
-            current_paragraph.append(text)
-        
-        # Check each category
-        for category, config in legal_categories.items():
-            found_terms = []
-            for term in config['terms']:
-                if term in text_lower:
-                    found_terms.append(term)
-            
-            if found_terms:
-                    # Get context (surrounding sentences)
-                context = ' '.join(current_paragraph)
-                
-                # Skip if the context is too short (likely just a header)
-                if len(context.split()) < 5:
-                    continue
-                    
-                # Skip if we've already processed this context or if it's contained in another context
-                if is_duplicate_or_contained(context, processed_contexts):
-                        continue
-                    
-                processed_contexts.append(context)
-                    
-                # Determine severity based on context
-                severity = 'Medium'
-                if any(word in context.lower() for word in ['material', 'significant', 'substantial', 'major']):
-                        severity = 'High'
-                    
-                    # Create the red flag
-                legal_red_flags.append(RedFlag(
-                        category=category,
-                    description=f"Found legal issues related to: {', '.join(found_terms)}",
-                        severity=severity,
-                    context=context
-                ))
-                logger.info(f"Found legal red flag: {category} - {', '.join(found_terms)} - {severity}")
-        
-        # Reset paragraph if we hit a new major section
-        if any(marker in text_lower for marker in ['item', 'part']):
-            current_paragraph = []
-            if not any(term in text_lower for term in ['legal', 'proceedings', 'litigation']):
-                in_legal_section = False
-    
-    # Create summary analysis
-    summary_analysis = []
-    for category in legal_categories.keys():
-        category_flags = [flag for flag in legal_red_flags if flag.category == category]
-        if category_flags:
-            summary_analysis.append({
-                'category': category,
-                'high_severity_count': sum(1 for flag in category_flags if flag.severity == 'High'),
-                'medium_severity_count': sum(1 for flag in category_flags if flag.severity == 'Medium'),
-                'flags': category_flags
-            })
-    
-    # Sort red flags by severity (High first, then Medium)
-    legal_red_flags.sort(key=lambda x: 0 if x.severity == 'High' else 1)
-    
-    return legal_red_flags, summary_analysis
-
-def find_mda_insights(elements: List['SemanticElement']) -> Tuple[List[RedFlag], List[Dict]]:
-    """Find insights in the Management Discussion & Analysis (MD&A) section."""
-    mda_insights = []
-    current_section = None
-    current_paragraph = []
-    in_mda_section = False
-    
-    # Track processed contexts to avoid duplicates
+def analyze_company_risks(elements: List['SemanticElement']) -> Tuple[List[RedFlag], List[Dict]]:
+    """Comprehensive analysis of company risks focusing on investor-relevant categories."""
+    logger.info("Starting investor-focused risk analysis")
+    risks = []
     processed_contexts = []
     
-    # Define MD&A categories with specific indicators
-    mda_categories = {
+    # Define investor-relevant risk categories with specific terms and context requirements
+    risk_categories = {
+        'Major Lawsuits': {
+            'terms': [
+                # Active litigation
+                'lawsuit filed', 'litigation pending', 'ongoing litigation',
+                'current lawsuit', 'active litigation', 'pending lawsuit',
+                # Specific types
+                'securities class action filed', 'shareholder derivative filed',
+                'antitrust lawsuit filed', 'patent infringement filed',
+                'regulatory enforcement action', 'sec enforcement proceeding',
+                # Original terms
+                'securities class action', 'securities fraud', 'shareholder class action',
+                'stockholder derivative', 'securities violation', 'insider trading',
+                'securities litigation', 'securities claim', 'securities lawsuit',
+                'sec investigation', 'sec enforcement', 'regulatory investigation',
+                'regulatory action', 'enforcement proceeding', 'regulatory violation',
+                'compliance issue', 'regulatory penalty', 'regulatory fine',
+                'regulatory settlement', 'regulatory order', 'regulatory finding',
+                'antitrust investigation', 'antitrust lawsuit', 'monopoly',
+                'anti-competitive', 'price fixing', 'market allocation',
+                'antitrust violation', 'competition law', 'market power',
+                'material litigation', 'significant lawsuit', 'major legal proceeding',
+                'substantial claim', 'material claim', 'material legal matter',
+                'legal proceeding', 'lawsuit', 'litigation', 'legal action',
+                'class action', 'breach of contract', 'dispute', 'arbitration'
+            ],
+            'required_context': [
+                'filed', 'pending', 'ongoing', 'current', 'active',
+                'material', 'significant', 'substantial', 'major',
+                'damages', 'penalty', 'fine', 'settlement', 'judgment',
+                'adverse', 'negative', 'unfavorable', 'damages',
+                'penalty', 'fine', 'settlement', 'judgment',
+                'could', 'may', 'might', 'will', 'would', 'should'
+            ]
+        },
+        'Auditor Opinions': {
+            'terms': [
+                # Adverse opinions
+                'adverse opinion', 'qualified opinion', 'going concern',
+                'material weakness', 'significant deficiency', 'internal control',
+                'accounting irregularity', 'restatement', 'material misstatement',
+                'audit committee', 'independent auditor', 'audit opinion',
+                'audit report', 'auditor resignation', 'auditor change',
+                'internal control', 'financial reporting', 'accounting policy',
+                'accounting estimate', 'accounting principle', 'accounting standard',
+                'financial statement', 'financial reporting', 'financial control'
+            ],
+            'required_context': [
+                'adverse', 'qualified', 'material weakness', 'significant deficiency',
+                'going concern', 'restatement', 'irregularity', 'resignation',
+                'change', 'replacement', 'termination', 'dismissal',
+                'could', 'may', 'might', 'will', 'would', 'should'
+            ]
+        },
+        'Management Changes': {
+            'terms': [
+                # Executive departures
+                'ceo departure', 'cfo departure', 'chief executive officer',
+                'chief financial officer', 'executive officer', 'key executive',
+                'executive departure', 'executive resignation', 'executive termination',
+                'executive change', 'executive transition', 'executive succession',
+                # Board changes
+                'board member', 'director resignation', 'board resignation',
+                'independent director', 'audit committee member', 'board change',
+                'board transition', 'board succession', 'board departure',
+                # Management structure
+                'management change', 'leadership change', 'organizational change',
+                'reporting structure', 'management team', 'executive team',
+                'management transition', 'leadership transition', 'organizational transition',
+                # Termination indicators
+                'termination', 'resignation', 'departure', 'separation',
+                'for cause', 'without cause', 'good reason', 'constructive termination'
+            ],
+            'required_context': [
+                'resignation', 'departure', 'termination', 'separation',
+                'change', 'replacement', 'succession', 'transition',
+                'interim', 'temporary', 'acting', 'permanent',
+                'could', 'may', 'might', 'will', 'would', 'should'
+            ]
+        },
+        'Cybersecurity & Data Privacy': {
+            'terms': [
+                # Security incidents
+                'data breach', 'security breach', 'cyber attack',
+                'hacking incident', 'unauthorized access', 'data theft',
+                # Privacy issues
+                'privacy violation', 'data privacy', 'personal information',
+                'customer data', 'user data', 'member data',
+                # System issues
+                'system failure', 'service disruption', 'outage',
+                'system compromise', 'security vulnerability'
+            ],
+            'required_context': [
+                'material', 'significant', 'substantial', 'major',
+                'adverse', 'negative', 'unfavorable', 'damage',
+                'impact', 'effect', 'consequence', 'result'
+            ]
+        },
+        'Related Party Transactions': {
+            'terms': [
+                # Explicit relationships
+                'related party transaction', 'related person transaction',
+                'insider transaction', 'executive transaction',
+                'director transaction', 'board member transaction',
+                # Specific relationships
+                'family member', 'immediate family', 'close family',
+                'executive', 'director', 'officer', 'board member',
+                'key employee', 'principal shareholder',
+                # Original terms
+                'affiliate transaction', 'insider transaction', 'executive transaction',
+                'director transaction', 'board member transaction', 'officer transaction',
+                'related party', 'related person', 'affiliate', 'insider',
+                'business relationship', 'personal relationship', 'financial relationship',
+                'family relationship', 'personal interest', 'business interest',
+                'purchase', 'sale', 'lease', 'loan', 'guarantee',
+                'indemnification', 'compensation', 'benefit', 'arrangement',
+                'transaction', 'agreement', 'contract', 'arrangement'
+            ],
+            'required_context': [
+                'material', 'significant', 'substantial', 'major',
+                'unusual', 'non-arm\'s length', 'conflict of interest',
+                'independence', 'approval', 'review', 'disclosure',
+                'transaction', 'agreement', 'contract', 'arrangement',
+                'could', 'may', 'might', 'will', 'would', 'should',
+                'related party', 'related person', 'affiliate', 'insider',
+                'family member', 'executive', 'director', 'officer',
+                'board member', 'key employee', 'principal shareholder'
+            ]
+        },
         'Financial Performance': {
             'terms': [
-                'revenue growth', 'revenue decline', 'net income', 'profit margin',
-                'operating margin', 'gross margin', 'earnings per share', 'cost of revenue',
-                'operating expenses', 'operating income', 'net sales', 'income from operations',
-                'profit', 'loss', 'cash flow', 'liquidity', 'capital resources'
+                # Revenue issues
+                'revenue decline', 'sales decline', 'profit decline',
+                'earnings decline', 'income decline', 'margin erosion',
+                # Financial problems
+                'loss', 'deficit', 'impairment', 'write-down',
+                'write-off', 'restructuring charge', 'goodwill impairment',
+                # Liquidity issues
+                'liquidity', 'working capital', 'cash flow',
+                'debt covenant', 'credit facility', 'borrowing base',
+                # Original terms
+                'profit margin', 'gross margin', 'operating margin',
+                'revenue', 'sales', 'profit', 'earnings', 'income',
+                'margin', 'profitability', 'earnings per share',
+                'cash', 'liquidity', 'working capital', 'capital',
+                'debt', 'credit', 'borrowing', 'financing',
+                'material change', 'significant change', 'substantial change',
+                'material impact', 'significant impact', 'substantial impact',
+                'change', 'impact', 'effect', 'influence', 'consequence',
+                'impairment', 'write-down', 'write-off', 'restructuring'
             ],
-            'context_required': True
+            'required_context': [
+                'material', 'significant', 'substantial', 'major',
+                'adverse', 'negative', 'unfavorable', 'decline',
+                'decrease', 'reduction', 'deterioration', 'weakening',
+                'percent', '%', 'million', 'billion', 'dollar',
+                'could', 'may', 'might', 'will', 'would', 'should'
+            ]
         },
-        'Market Conditions': {
+        'Competition': {
             'terms': [
-                'market conditions', 'competitive environment', 'industry trends',
-                'market share', 'market position', 'competition', 'competitive pressure',
-                'market demand', 'market growth', 'market opportunity', 'market risk',
-                'economic conditions', 'macroeconomic', 'market dynamics'
+                # Market position
+                'market share loss', 'competitive position loss',
+                'market position loss', 'competitive disadvantage',
+                # Customer impact
+                'customer loss', 'customer defection', 'customer retention',
+                'customer concentration', 'key customer loss',
+                # Product issues
+                'product obsolescence', 'technological change',
+                'disruptive technology', 'new entrant', 'substitute product',
+                # Original terms
+                'market share', 'competitive position', 'market position',
+                'competitive pressure', 'pricing pressure', 'market competition',
+                'market', 'competition', 'competitive', 'pricing',
+                'customer', 'client', 'buyer', 'purchaser', 'consumer',
+                'customer base', 'customer relationship', 'customer service',
+                'product', 'technology', 'innovation', 'development',
+                'research', 'r&d', 'patent', 'intellectual property',
+                'industry change', 'market change', 'competitive landscape',
+                'competitive environment', 'market disruption', 'industry disruption',
+                'industry', 'market', 'sector', 'business', 'commercial'
             ],
-            'context_required': True
-        },
-        'Operations': {
-            'terms': [
-                'supply chain', 'production', 'manufacturing', 'inventory',
-                'distribution', 'operational efficiency', 'capacity utilization',
-                'productivity', 'cost reduction', 'operating costs', 'infrastructure',
-                'facilities', 'equipment', 'workforce', 'staffing'
-            ],
-            'context_required': True
-        },
-        'Strategy': {
-            'terms': [
-                'strategic initiatives', 'growth strategy', 'business strategy',
-                'expansion plans', 'investment strategy', 'acquisition strategy',
-                'product development', 'research and development', 'innovation',
-                'market expansion', 'cost management', 'restructuring'
-            ],
-            'context_required': True
-        },
-        'Risk Factors': {
-            'terms': [
-                'risk factors', 'uncertainties', 'challenges', 'risks',
-                'material changes', 'adverse effects', 'negative impact',
-                'volatility', 'exposure', 'dependency', 'critical accounting',
-                'significant estimates', 'contingencies'
-            ],
-            'context_required': True
+            'required_context': [
+                'material', 'significant', 'substantial', 'major',
+                'adverse', 'negative', 'unfavorable', 'decline',
+                'decrease', 'reduction', 'deterioration', 'weakening',
+                'competitor', 'competition', 'competitive', 'market',
+                'could', 'may', 'might', 'will', 'would', 'should'
+            ]
         }
     }
     
-    # Section header patterns to identify MD&A section
-    section_header_patterns = [
-        r'^item\s*[27]\.?\s*management.*discussion',
-        r'^management.*discussion.*analysis',
-        r'^md&a',
-        r'^management.*analysis',
-        r'^financial.*condition.*results',
-        r'^results.*operations',
-        r'^operating.*financial.*review',
-        r'^part\s+\d+',
-        r'^item\s+\d+'
-    ]
-    
-    # MD&A section indicators
-    mda_section_indicators = [
-        'financial condition', 'results of operations', 'operating results',
-        'financial performance', 'liquidity', 'capital resources',
-        'critical accounting', 'market risk', 'forward-looking',
-        'key performance', 'business outlook', 'future prospects'
-    ]
-    
-    def is_section_header(text: str) -> bool:
-        """Check if the text matches any section header patterns."""
-        text = text.lower().strip()
-        return any(re.match(pattern, text) for pattern in section_header_patterns)
+    def has_negative_sentiment(text: str) -> bool:
+        """Check if the text has negative sentiment with a more balanced threshold."""
+        sentiment = TextBlob(text).sentiment.polarity
+        return sentiment < -0.2  # More balanced threshold for negative sentiment
     
     def normalize_text(text: str) -> str:
         """Normalize text for comparison by removing extra whitespace and punctuation."""
@@ -788,107 +703,78 @@ def find_mda_insights(elements: List['SemanticElement']) -> Tuple[List[RedFlag],
                 return True
         return False
     
+    # Process all elements for risks
     for element in elements:
-        if not element.content:
+        # Skip empty elements and tables
+        if not element.text or element.type == 'table':
             continue
             
-        try:
-            text = element.text.strip()
-            if not text:
-                continue
-                
-            # Check for MD&A section headers
-            if is_section_header(text):
-                if element.type == 'heading':
-                    if any(marker in text.lower() for marker in ['management', 'md&a', 'discussion']):
-                        in_mda_section = True
-                        logger.info(f"Entered MD&A section with header: {text}")
-                    elif any(marker in text.lower() for marker in ['item', 'part']) and in_mda_section:
-                        if not any(term in text.lower() for term in ['management', 'md&a', 'discussion']):
-                            in_mda_section = False
-                            logger.info("Exited MD&A section")
-                continue
-                
-            text_lower = text.lower()
-            
-        except Exception as e:
-            logger.warning(f"Error getting text from element: {str(e)}")
-            continue
-            
-        # Check if we're in the MD&A section
-        if not in_mda_section:
-            # Count MD&A indicators in the text
-            mda_indicator_count = sum(1 for indicator in mda_section_indicators if indicator in text_lower)
-            if mda_indicator_count >= 2:  # Require multiple indicators to avoid false positives
-                in_mda_section = True
-                logger.info(f"Entered MD&A section based on content: {text[:100]}...")
-            else:
-                continue
+        text = element.text.lower()
         
-        # Add text to current paragraph if it's not a section header
-        if not is_section_header(text):
-            current_paragraph.append(text)
-        
-        # Check each category
-        for category, config in mda_categories.items():
-            found_terms = []
+        # Process each category
+        for category, config in risk_categories.items():
             for term in config['terms']:
-                if term in text_lower:
-                    found_terms.append(term)
-            
-            if found_terms:
-                # Get context (surrounding sentences)
-                context = ' '.join(current_paragraph)
-                
-                # Skip if the context is too short (likely just a header)
-                if len(context.split()) < 5:
-                    continue
+                if term in text:
+                    # Get the full text as context
+                    context = element.text.strip()
                     
-                # Skip if we've already processed this context or if it's contained in another context
-                if is_duplicate_or_contained(context, processed_contexts):
-                    continue
+                    # Skip if context is too short or already processed
+                    if len(context.split()) < 5 or is_duplicate_or_contained(context, processed_contexts):
+                        continue
                     
-                processed_contexts.append(context)
-                
-                # Determine significance based on context
-                significance = 'Medium'
-                if any(word in context.lower() for word in [
-                    'material', 'significant', 'substantial', 'major',
-                    'critical', 'important', 'key', 'essential', 'fundamental'
-                ]):
-                    significance = 'High'
-                
-                # Create the insight
-                mda_insights.append(RedFlag(
-                    category=category,
-                    description=f"Found {category.lower()} discussion related to: {', '.join(found_terms)}",
-                    severity=significance,  # Using severity field for significance level
-                    context=context
-                ))
-                logger.info(f"Found MD&A insight: {category} - {', '.join(found_terms)} - {significance}")
-        
-        # Reset paragraph if we hit a new major section
-        if any(marker in text_lower for marker in ['item', 'part']):
-            current_paragraph = []
-            if not any(term in text_lower for term in ['management', 'md&a', 'discussion', 'analysis']):
-                in_mda_section = False
+                    # Check for required context terms
+                    if not any(context_term in text for context_term in config['required_context']):
+                        continue
+                        
+                    # Only flag if the context has negative sentiment
+                    if has_negative_sentiment(context):
+                        processed_contexts.append(context)
+                        
+                        # Determine severity based on sentiment and context
+                        sentiment = TextBlob(context).sentiment.polarity
+                        severity = 'High' if sentiment < -0.4 else 'Medium'  # More balanced threshold for High severity
+                        
+                        # Check for additional severity indicators
+                        severity_indicators = [
+                            'material', 'significant', 'substantial', 'major',
+                            'critical', 'important', 'key', 'essential', 'fundamental',
+                            'adverse', 'serious', 'severe', 'material adverse effect',
+                            'could', 'may', 'might', 'will', 'would', 'should',
+                            'risk', 'uncertainty', 'challenge', 'threat', 'concern',
+                            'issue', 'problem', 'difficulty', 'obstacle', 'barrier'
+                        ]
+                        
+                        if any(indicator in text for indicator in severity_indicators):
+                            severity = 'High'
+                        
+                        risks.append(RedFlag(
+                            category=category,
+                            description=f"Potential {category} risk related to {term}",
+                            severity=severity,
+                            context=context
+                        ))
+                        logger.info(f"Found {severity} risk in category {category}: {term}")
     
-    # Create summary analysis
-    summary_analysis = []
-    for category in mda_categories.keys():
-        category_insights = [insight for insight in mda_insights if insight.category == category]
-        if category_insights:
-            summary_analysis.append({
+    # Create summary by category
+    summary = []
+    for category in risk_categories.keys():
+        category_risks = [r for r in risks if r.category == category]
+        high_severity = len([r for r in category_risks if r.severity == 'High'])
+        medium_severity = len([r for r in category_risks if r.severity == 'Medium'])
+        
+        if category_risks:
+            summary.append({
                 'category': category,
-                'high_significance_count': sum(1 for insight in category_insights if insight.severity == 'High'),
-                'medium_significance_count': sum(1 for insight in category_insights if insight.severity == 'Medium'),
-                'insights': category_insights
+                'high_severity_count': high_severity,
+                'medium_severity_count': medium_severity,
+                'risks': category_risks
             })
     
-    # Sort insights by significance (High first, then Medium)
-    mda_insights.sort(key=lambda x: 0 if x.severity == 'High' else 1)
+    # Sort risks by severity (High first, then Medium)
+    risks.sort(key=lambda x: 0 if x.severity == 'High' else 1)
     
-    return mda_insights, summary_analysis
+    logger.info(f"Risk analysis complete. Found {len(risks)} risks across {len(summary)} categories")
+    return risks, summary
 
 def analyze_company_focus(elements: List['SemanticElement']) -> Dict[str, Any]:
     """Analyze company focus areas using NLP techniques."""
@@ -1000,14 +886,11 @@ def display_document_structure(structure):
                     if not item['content'] and not item['subsections']:
                         st.info("No content available for this section")
 
-def find_section_content(soup: BeautifulSoup, section_title: str) -> Dict:
-    """Find the content and subsections of a given section using regex patterns."""
+def find_section_content(elements: List['SemanticElement'], section_title: str) -> Dict:
+    """Find the content and subsections of a given section."""
     logger.info(f"Finding content for section: {section_title}")
     content = []
     subsections = []
-    
-    # Get the full HTML content
-    html_content = str(soup)
     
     # Create regex pattern for the section
     # Handle both formats: "Item X. Title" and just "Title"
@@ -1024,49 +907,40 @@ def find_section_content(soup: BeautifulSoup, section_title: str) -> Dict:
         pattern = re.compile(re.escape(section_title), re.IGNORECASE | re.MULTILINE)
     
     # Find the section start
-    section_match = pattern.search(html_content)
-    if not section_match:
+    section_start = None
+    for i, element in enumerate(elements):
+        if pattern.search(element.text):
+            section_start = i
+            break
+    
+    if section_start is None:
         logger.warning(f"Could not find section header for: {section_title}")
         return {'content': [], 'subsections': []}
     
     # Find the next section start (look for next Item X pattern)
     next_section_pattern = re.compile(r'Item\s+\d+[A-Z]?\s*\.', re.IGNORECASE | re.MULTILINE)
-    next_section_match = next_section_pattern.search(html_content, section_match.end())
-    
-    # Extract content between current section and next section
-    if next_section_match:
-        section_content = html_content[section_match.start():next_section_match.start()]
-    else:
-        section_content = html_content[section_match.start():]
-    
-    # Parse the section content with BeautifulSoup
-    section_soup = BeautifulSoup(section_content, 'html.parser')
-    
-    # First, try to find the main content div
-    main_content = None
-    for div in section_soup.find_all('div'):
-        if 'class' in div.attrs and any(cls in div['class'] for cls in ['content', 'text', 'main']):
-            main_content = div
+    section_end = None
+    for i in range(section_start + 1, len(elements)):
+        if next_section_pattern.search(elements[i].text):
+            section_end = i
             break
     
-    # If we found a main content div, use that
-    if main_content:
-        section_soup = main_content
-    
-    # Extract all text elements
-    current_subsection = None
+    # Extract content between current section and next section
+    section_elements = elements[section_start:section_end] if section_end else elements[section_start:]
     
     # Process all elements in order
-    for element in section_soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div']):
+    current_subsection = None
+    
+    for element in section_elements:
         # Skip navigation elements and page headings
-        if any(marker in element.get_text().lower() for marker in [
+        if any(marker in element.text.lower() for marker in [
             'table of contents', 'next page', 'previous page',
             'form 10-k', 'form 10-q', 'form 8-k', '|', 'page'
         ]):
             continue
         
         # Get the text content
-        text = element.get_text(strip=True)
+        text = element.text.strip()
         if not text:
             continue
         
@@ -1076,7 +950,7 @@ def find_section_content(soup: BeautifulSoup, section_title: str) -> Dict:
         
         # Check if this is a subsection header
         is_subsection = (
-            element.name in ['h3', 'h4', 'h5', 'h6'] or
+            element.type == 'heading' or
             (len(text.split()) <= 6 and text.endswith(':')) or
             re.match(r'^[A-Z][A-Za-z\s]{2,}[.:]', text) or
             re.match(r'^[A-Z][A-Za-z\s]{2,}\s*$', text)  # Also match headers without punctuation
@@ -1128,10 +1002,9 @@ def find_section_content(soup: BeautifulSoup, section_title: str) -> Dict:
     # If we found no content, try a more aggressive approach
     if not content and not subsections:
         logger.info("No content found with standard approach, trying aggressive extraction")
-        # Try to find the section by looking for the title in the HTML
-        section_elements = section_soup.find_all(['p', 'div'])
+        # Try to find the section by looking for the title in the elements
         for element in section_elements:
-            text = element.get_text(strip=True)
+            text = element.text.strip()
             if text and len(text.split()) > 3:
                 content.append({
                     'type': 'text',
