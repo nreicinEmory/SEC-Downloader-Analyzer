@@ -60,7 +60,7 @@ streamlit run app.py
 
 - `app.py`: Main Streamlit application
 - `sec_analyzer/`: Core analysis module
-  - `downloader.py`: Handles SEC filing downloads with rate limiting
+  - `downloader.py`: Handles SEC filing downloads
   - `semantic_processor.py`: Processes and analyzes filings
   - `fin_ratios.py`: Financial metrics and ratio calculations
   - `types.py`: Data structures and type definitions
