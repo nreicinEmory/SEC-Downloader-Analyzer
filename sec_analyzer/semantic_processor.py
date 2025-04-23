@@ -6,8 +6,7 @@ import re
 import logging
 from bs4 import BeautifulSoup, Tag
 from typing import Dict, List, Optional, Any, Tuple
-from .parsing.parsers import SEC10KParser, SEC10QParser
-from .types import FinancialMetric, RedFlag, SemanticElement
+from .types import RedFlag, SemanticElement
 import streamlit as st
 from textblob import TextBlob
 
@@ -142,14 +141,11 @@ def process_html(html_content: str, form_type: str = '10-K') -> Dict[str, Any]:
     document_structure = create_document_structure(elements)
     
     # Extract other information using the same elements
-    financial_data = extract_financial_data(elements)
     risks, risk_summary = analyze_company_risks(elements)
     focus_analysis = analyze_company_focus(elements)
     
     result = {
         'document_structure': document_structure,
-        'metrics': financial_data['metrics'],
-        'ratios': financial_data['ratios'],
         'risks': risks,
         'risk_summary': risk_summary,
         'focus_analysis': focus_analysis
@@ -223,266 +219,171 @@ def create_document_structure(elements: List['SemanticElement']) -> List[Dict]:
     
     return structure
 
-def extract_section_content(element) -> str:
-    """Extract content from a section element."""
-    content = [element.text]
-    for child in element.children:
-        content.append(child.text)
-    return '\n'.join(content)
-
-def is_financial_statement(table: 'SemanticElement') -> bool:
-    """Check if a table is likely a financial statement."""
-    if not table.content:
-        return False
+def find_section_content(elements: List['SemanticElement'], section_title: str) -> Dict:
+    """Find the content and subsections of a given section."""
+    logger.info(f"Finding content for section: {section_title}")
+    content = []
+    subsections = []
+    
+    # Create regex pattern for the section
+    # Handle both formats: "Item X. Title" and just "Title"
+    if 'Item' in section_title:
+        item_number = re.search(r'Item\s+(\d+[A-Z]?)', section_title)
+        if item_number:
+            # Pattern for "Item X. Title" format
+            pattern = re.compile(
+                rf'Item\s+{item_number.group(1)}\s*\.?\s*{re.escape(section_title.split(".", 1)[1].strip())}',
+                re.IGNORECASE | re.MULTILINE
+            )
+    else:
+        # Pattern for just the title
+        pattern = re.compile(re.escape(section_title), re.IGNORECASE | re.MULTILINE)
+    
+    # Find the section start
+    section_start = None
+    for i, element in enumerate(elements):
+        if pattern.search(element.text):
+            section_start = i
+            break
+    
+    if section_start is None:
+        logger.warning(f"Could not find section header for: {section_title}")
+        return {'content': [], 'subsections': []}
+    
+    # Find the next section start (look for next Item X pattern)
+    next_section_pattern = re.compile(r'Item\s+\d+[A-Z]?\s*\.', re.IGNORECASE | re.MULTILINE)
+    section_end = None
+    for i in range(section_start + 1, len(elements)):
+        if next_section_pattern.search(elements[i].text):
+            section_end = i
+            break
+    
+    # Extract content between current section and next section
+    section_elements = elements[section_start:section_end] if section_end else elements[section_start:]
+    
+    # Process all elements in order
+    current_subsection = None
+    
+    for element in section_elements:
+        # Skip navigation elements and page headings
+        if any(marker in element.text.lower() for marker in [
+            'table of contents', 'next page', 'previous page',
+            'form 10-k', 'form 10-q', 'form 8-k', '|', 'page'
+        ]):
+            continue
         
-    # Get the text from the table and its surrounding context
-    table_text = table.content.get_text().lower()
-    parent_text = table.parent.get_text().lower() if table.parent else ""
-    
-    # Combine table and parent text for better context
-    context = f"{parent_text} {table_text}"
-    
-    # Check for financial statement indicators
-    indicators = [
-        'balance sheet', 'income statement', 'statement of operations',
-        'statement of cash flows', 'statement of financial position',
-        'consolidated statements', 'financial statements',
-        'revenue', 'net income', 'total assets', 'total liabilities',
-        'cash and equivalents', 'operating income'
-    ]
-    
-    return any(indicator in context for indicator in indicators)
-
-def get_table_scale(table: 'SemanticElement') -> int:
-    """Determine the scale of numbers in a table based on surrounding text."""
-    if not table.content:
-        return 1
+        # Get the text content
+        text = element.text.strip()
+        if not text:
+            continue
         
-    # Get text from table and surrounding context
-    table_text = table.content.get_text().lower()
-    parent_text = table.parent.get_text().lower() if table.parent else ""
-    context = f"{parent_text} {table_text}"
-    
-    # Look for scale indicators in the context
-    if 'millions' in context or '(in millions)' in context:
-        return 1_000_000
-    elif 'billions' in context or '(in billions)' in context:
-        return 1_000_000_000
-    elif 'thousands' in context or '(in thousands)' in context:
-        return 1_000
-    return 1
-
-def extract_financial_data(elements: List['SemanticElement']) -> Dict[str, Any]:
-    """Extract financial data from semantic elements."""
-    result = {
-        'metrics': [],
-        'ratios': [],
-        'periods': set()
-    }
-    
-    # Track the most recent value for each metric
-    latest_metrics = {}
-    
-    for element in elements:
-        if element.type == 'table' and is_financial_statement(element):
-            logger.info("Found financial statement table")
-            
-            # Get the scale for this table
-            scale = get_table_scale(element)
-            logger.info(f"Detected scale: {scale}")
-            
-            # Find header row and data rows
-            header_row = None
-            data_rows = []
-            
-            for row in element.content.find_all('tr'):
-                cells = row.find_all(['td', 'th'])
-                if not cells:
-                    continue
-                    
-                # Check if this is a header row
-                if any('$' in cell.get_text() for cell in cells):
-                    header_row = cells
-                else:
-                    data_rows.append(cells)
-            
-            if not header_row or not data_rows:
-                continue
-                
-            # Process data rows
-            for row in data_rows:
-                if len(row) < 2:
-                    continue
-                    
-                label = row[0].get_text().strip().lower()
-                value_cells = row[1:]
-                
-                # Extract values for each period
-                for i, cell in enumerate(value_cells):
-                    value_text = cell.get_text().strip()
-                    if not value_text:
-                        continue
-                        
-                    try:
-                        parsed_value = parse_amount(value_text)
-                        if parsed_value is None:
-                            logger.debug(f"Could not parse value from text: {value_text}")
-                            continue
-                            
-                        value = parsed_value * scale
-                        
-                        # Create metric key based on label
-                        metric_key = None
-                        if 'revenue' in label or 'sales' in label:
-                            metric_key = 'Revenue'
-                        elif 'gross profit' in label:
-                            metric_key = 'Gross Profit'
-                        elif 'operating income' in label or 'operating profit' in label:
-                            metric_key = 'Operating Income'
-                        elif 'net income' in label:
-                            metric_key = 'Net Income'
-                        elif 'total assets' in label:
-                            metric_key = 'Total Assets'
-                        elif 'total liabilities' in label:
-                            metric_key = 'Total Liabilities'
-                        elif 'cash' in label and 'equivalents' in label:
-                            metric_key = 'Cash and Equivalents'
-                        elif 'inventory' in label:
-                            metric_key = 'Inventory'
-                        elif 'accounts receivable' in label:
-                            metric_key = 'Accounts Receivable'
-                        elif 'accounts payable' in label:
-                            metric_key = 'Accounts Payable'
-                        elif 'research' in label and 'development' in label:
-                            metric_key = 'R&D Expenses'
-                        elif 'depreciation' in label:
-                            metric_key = 'Depreciation'
-                        elif 'amortization' in label:
-                            metric_key = 'Amortization'
-                        elif 'capital expenditures' in label:
-                            metric_key = 'Capital Expenditures'
-                        elif 'dividends' in label:
-                            metric_key = 'Dividends'
-                        elif 'stockholders' in label and 'equity' in label:
-                            metric_key = 'Stockholders Equity'
-                        elif 'long-term debt' in label:
-                            metric_key = 'Long-term Debt'
-                        elif 'short-term debt' in label:
-                            metric_key = 'Short-term Debt'
-                            
-                        if metric_key:
-                            # Update the latest value for this metric
-                            latest_metrics[metric_key] = value
-                            
-                    except ValueError as e:
-                        logger.warning(f"Error parsing value '{value_text}': {e}")
-                        continue
-    
-    # Add the latest values to the result
-    for metric_name, value in latest_metrics.items():
-        result['metrics'].append(FinancialMetric(metric_name, value, 'USD'))
-    
-    # Calculate financial ratios using the latest values
-    metrics_dict = {m.name: m.value for m in result['metrics']}
-    
-    # Profitability Ratios
-    if 'Revenue' in metrics_dict and 'Net Income' in metrics_dict and metrics_dict['Revenue'] != 0:
-        result['ratios'].append(FinancialMetric('Net Profit Margin', 
-            (metrics_dict['Net Income'] / metrics_dict['Revenue']) * 100, '%'))
-    
-    if 'Revenue' in metrics_dict and 'Gross Profit' in metrics_dict and metrics_dict['Revenue'] != 0:
-        result['ratios'].append(FinancialMetric('Gross Margin', 
-            (metrics_dict['Gross Profit'] / metrics_dict['Revenue']) * 100, '%'))
-    
-    if 'Operating Income' in metrics_dict and 'Revenue' in metrics_dict and metrics_dict['Revenue'] != 0:
-        result['ratios'].append(FinancialMetric('Operating Margin', 
-            (metrics_dict['Operating Income'] / metrics_dict['Revenue']) * 100, '%'))
-    
-    # Liquidity Ratios
-    if 'Total Assets' in metrics_dict and 'Total Liabilities' in metrics_dict and metrics_dict['Total Assets'] != 0:
-        result['ratios'].append(FinancialMetric('Debt to Assets', 
-            (metrics_dict['Total Liabilities'] / metrics_dict['Total Assets']) * 100, '%'))
-    
-    if 'Cash and Equivalents' in metrics_dict and 'Total Liabilities' in metrics_dict and metrics_dict['Total Liabilities'] != 0:
-        result['ratios'].append(FinancialMetric('Cash to Debt', 
-            (metrics_dict['Cash and Equivalents'] / metrics_dict['Total Liabilities']) * 100, '%'))
-    
-    # Efficiency Ratios
-    if 'Revenue' in metrics_dict and 'Accounts Receivable' in metrics_dict and metrics_dict['Accounts Receivable'] != 0:
-        result['ratios'].append(FinancialMetric('Receivables Turnover', 
-            (metrics_dict['Revenue'] / metrics_dict['Accounts Receivable']), 'x'))
-    
-    if 'Revenue' in metrics_dict and 'Inventory' in metrics_dict and metrics_dict['Inventory'] != 0:
-        result['ratios'].append(FinancialMetric('Inventory Turnover', 
-            (metrics_dict['Revenue'] / metrics_dict['Inventory']), 'x'))
-    
-    # Growth Metrics
-    if 'R&D Expenses' in metrics_dict and 'Revenue' in metrics_dict and metrics_dict['Revenue'] != 0:
-        result['ratios'].append(FinancialMetric('R&D to Revenue', 
-            (metrics_dict['R&D Expenses'] / metrics_dict['Revenue']) * 100, '%'))
-    
-    if 'Capital Expenditures' in metrics_dict and 'Revenue' in metrics_dict and metrics_dict['Revenue'] != 0:
-        result['ratios'].append(FinancialMetric('Capex to Revenue', 
-            (metrics_dict['Capital Expenditures'] / metrics_dict['Revenue']) * 100, '%'))
-    
-    return result
-
-def parse_amount(text: str) -> Optional[float]:
-    """Parse a financial amount from text, handling various formats and scales."""
-    if not text:
-        logger.debug("Empty text provided to parse_amount")
-        return None
+        # Skip very short text that's likely just formatting
+        if len(text.split()) < 3:
+            continue
         
-    # Remove any non-numeric characters except decimal point, minus sign, and scale indicators
-    cleaned = text.strip()
-    logger.debug(f"Attempting to parse amount from text: {cleaned}")
-    
-    # Handle negative numbers in parentheses
-    if cleaned.startswith('(') and cleaned.endswith(')'):
-        cleaned = '-' + cleaned[1:-1]
-        logger.debug(f"Converted parentheses to negative: {cleaned}")
-    
-    # Extract scale from the text
-    scale = 1
-    if 'million' in cleaned.lower() or 'm' in cleaned.lower():
-        scale = 1_000_000
-        cleaned = cleaned.lower().replace('million', '').replace('m', '')
-        logger.debug(f"Detected millions scale: {cleaned}")
-    elif 'billion' in cleaned.lower() or 'b' in cleaned.lower():
-        scale = 1_000_000_000
-        cleaned = cleaned.lower().replace('billion', '').replace('b', '')
-        logger.debug(f"Detected billions scale: {cleaned}")
-    elif 'thousand' in cleaned.lower() or 'k' in cleaned.lower():
-        scale = 1_000
-        cleaned = cleaned.lower().replace('thousand', '').replace('k', '')
-        logger.debug(f"Detected thousands scale: {cleaned}")
-    
-    # Remove any remaining non-numeric characters
-    cleaned = ''.join(c for c in cleaned if c.isdigit() or c in '.-')
-    logger.debug(f"Cleaned text: {cleaned}")
-    
-    if not cleaned:
-        logger.debug("No numeric characters found after cleaning")
-        return None
+        # Check if this is a subsection header
+        is_subsection = (
+            element.type == 'heading' or
+            (len(text.split()) <= 6 and text.endswith(':')) or
+            re.match(r'^[A-Z][A-Za-z\s]{2,}[.:]', text) or
+            re.match(r'^[A-Z][A-Za-z\s]{2,}\s*$', text)  # Also match headers without punctuation
+        )
         
-    try:
-        # Handle scientific notation
-        if 'e' in cleaned.lower() or 'e-' in cleaned.lower():
-            value = float(cleaned)
-            logger.debug(f"Parsed scientific notation: {value}")
+        if is_subsection:
+            # If we have a current subsection, add it to subsections
+            if current_subsection and current_subsection['content']:
+                subsections.append(current_subsection)
+            
+            # Start a new subsection
+            current_subsection = {
+                'title': text,
+                'content': []
+            }
         else:
-            # Handle regular numbers
-            value = float(cleaned.replace(',', ''))
-            logger.debug(f"Parsed regular number: {value}")
-            
-        # Apply scale
-        result = value * scale
-        logger.debug(f"Final value after scale: {result}")
-        return result
+            # Skip common elements we don't want
+            if not any(skip in text.lower() for skip in [
+                'forward-looking statement',
+                'table of contents',
+                'documents incorporated by reference',
+                'part ii',
+                'part iii',
+                'part iv'
+            ]):
+                # Clean up the text
+                text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+                text = text.strip()
+                
+                # Add as regular text content
+                text_content = {
+                    'type': 'text',
+                    'content': text
+                }
+                
+                if current_subsection:
+                    current_subsection['content'].append(text_content)
+                else:
+                    content.append(text_content)
+    
+    # Add the last subsection if it exists
+    if current_subsection and current_subsection['content']:
+        subsections.append(current_subsection)
+    
+    # Clean up content and subsections
+    # Remove very short or empty content
+    content = [c for c in content if len(c['content'].split()) > 3]
+    
+    # Remove duplicate paragraphs
+    unique_content = []
+    seen = set()
+    for c in content:
+        # Normalize text for comparison
+        normalized = ' '.join(c['content'].split())
+        if normalized not in seen:
+            seen.add(normalized)
+            unique_content.append(c)
+    
+    # Clean subsections
+    cleaned_subsections = []
+    seen_titles = set()
+    
+    for subsection in subsections:
+        # Skip empty subsections
+        if not subsection['content']:
+            continue
         
-    except ValueError as e:
-        logger.warning(f"Could not parse amount from text: {text}. Error: {str(e)}")
-        return None
+        # Normalize title
+        title = ' '.join(subsection['title'].split())
+        if title not in seen_titles:
+            seen_titles.add(title)
+            # Clean subsection content
+            subsection_content = []
+            seen_content = set()
+            for c in subsection['content']:
+                normalized = ' '.join(c['content'].split())
+                if normalized not in seen_content and len(normalized.split()) > 3:
+                    seen_content.add(normalized)
+                    subsection_content.append(c)
+            
+            if subsection_content:  # Only add if there's content after cleaning
+                subsection['content'] = subsection_content
+                cleaned_subsections.append(subsection)
+    
+    # If we found no content, try a more aggressive approach
+    if not unique_content and not cleaned_subsections:
+        logger.info("No content found with standard approach, trying aggressive extraction")
+        # Try to find the section by looking for the title in the elements
+        for element in section_elements:
+            text = element.text.strip()
+            if text and len(text.split()) > 3:
+                unique_content.append({
+                    'type': 'text',
+                    'content': text
+                })
+    
+    return {
+        'content': unique_content,
+        'subsections': cleaned_subsections
+    }
 
 def analyze_company_risks(elements: List['SemanticElement']) -> Tuple[List[RedFlag], List[Dict]]:
     """Comprehensive analysis of company risks focusing on investor-relevant categories."""
@@ -884,171 +785,4 @@ def display_document_structure(structure):
                                         st.write("")  # Add spacing between paragraphs
                     
                     if not item['content'] and not item['subsections']:
-                        st.info("No content available for this section")
-
-def find_section_content(elements: List['SemanticElement'], section_title: str) -> Dict:
-    """Find the content and subsections of a given section."""
-    logger.info(f"Finding content for section: {section_title}")
-    content = []
-    subsections = []
-    
-    # Create regex pattern for the section
-    # Handle both formats: "Item X. Title" and just "Title"
-    if 'Item' in section_title:
-        item_number = re.search(r'Item\s+(\d+[A-Z]?)', section_title)
-        if item_number:
-            # Pattern for "Item X. Title" format
-            pattern = re.compile(
-                rf'Item\s+{item_number.group(1)}\s*\.?\s*{re.escape(section_title.split(".", 1)[1].strip())}',
-                re.IGNORECASE | re.MULTILINE
-            )
-    else:
-        # Pattern for just the title
-        pattern = re.compile(re.escape(section_title), re.IGNORECASE | re.MULTILINE)
-    
-    # Find the section start
-    section_start = None
-    for i, element in enumerate(elements):
-        if pattern.search(element.text):
-            section_start = i
-            break
-    
-    if section_start is None:
-        logger.warning(f"Could not find section header for: {section_title}")
-        return {'content': [], 'subsections': []}
-    
-    # Find the next section start (look for next Item X pattern)
-    next_section_pattern = re.compile(r'Item\s+\d+[A-Z]?\s*\.', re.IGNORECASE | re.MULTILINE)
-    section_end = None
-    for i in range(section_start + 1, len(elements)):
-        if next_section_pattern.search(elements[i].text):
-            section_end = i
-            break
-    
-    # Extract content between current section and next section
-    section_elements = elements[section_start:section_end] if section_end else elements[section_start:]
-    
-    # Process all elements in order
-    current_subsection = None
-    
-    for element in section_elements:
-        # Skip navigation elements and page headings
-        if any(marker in element.text.lower() for marker in [
-            'table of contents', 'next page', 'previous page',
-            'form 10-k', 'form 10-q', 'form 8-k', '|', 'page'
-        ]):
-            continue
-        
-        # Get the text content
-        text = element.text.strip()
-        if not text:
-            continue
-        
-        # Skip very short text that's likely just formatting
-        if len(text.split()) < 3:
-            continue
-        
-        # Check if this is a subsection header
-        is_subsection = (
-            element.type == 'heading' or
-            (len(text.split()) <= 6 and text.endswith(':')) or
-            re.match(r'^[A-Z][A-Za-z\s]{2,}[.:]', text) or
-            re.match(r'^[A-Z][A-Za-z\s]{2,}\s*$', text)  # Also match headers without punctuation
-        )
-        
-        if is_subsection:
-            # If we have a current subsection, add it to subsections
-            if current_subsection and current_subsection['content']:
-                subsections.append(current_subsection)
-            
-            # Start a new subsection
-            current_subsection = {
-                'title': text,
-                'content': []
-            }
-        else:
-            # Skip common elements we don't want
-            if not any(skip in text.lower() for skip in [
-                'forward-looking statement',
-                'table of contents',
-                'documents incorporated by reference',
-                'part ii',
-                'part iii',
-                'part iv'
-            ]):
-                # Clean up the text
-                text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
-                text = text.strip()
-                
-                # Add as regular text content
-                text_content = {
-                    'type': 'text',
-                    'content': text
-                }
-                
-                if current_subsection:
-                    current_subsection['content'].append(text_content)
-                else:
-                    content.append(text_content)
-    
-    # Add the last subsection if it exists
-    if current_subsection and current_subsection['content']:
-        subsections.append(current_subsection)
-    
-    # Clean up content
-    content = clean_content(content)
-    subsections = clean_subsections(subsections)
-    
-    # If we found no content, try a more aggressive approach
-    if not content and not subsections:
-        logger.info("No content found with standard approach, trying aggressive extraction")
-        # Try to find the section by looking for the title in the elements
-        for element in section_elements:
-            text = element.text.strip()
-            if text and len(text.split()) > 3:
-                content.append({
-                    'type': 'text',
-                    'content': text
-                })
-    
-    return {
-        'content': content,
-        'subsections': subsections
-    }
-
-def clean_content(content: List[str]) -> List[str]:
-    """Clean and deduplicate content."""
-    # Remove very short or empty content
-    content = [c for c in content if len(c.split()) > 3]
-    
-    # Remove duplicate paragraphs
-    unique_content = []
-    seen = set()
-    for c in content:
-        # Normalize text for comparison
-        normalized = ' '.join(c.split())
-        if normalized not in seen:
-            seen.add(normalized)
-            unique_content.append(c)
-    
-    return unique_content
-
-def clean_subsections(subsections: List[Dict]) -> List[Dict]:
-    """Clean and deduplicate subsections."""
-    cleaned = []
-    seen_titles = set()
-    
-    for subsection in subsections:
-        # Skip empty subsections
-        if not subsection['content']:
-            continue
-        
-        # Normalize title
-        title = ' '.join(subsection['title'].split())
-        if title not in seen_titles:
-            seen_titles.add(title)
-            subsection['content'] = clean_content(subsection['content'])
-            if subsection['content']:  # Only add if there's content after cleaning
-                cleaned.append(subsection)
-    
-    return cleaned 
+                        st.info("No content available for this section") 

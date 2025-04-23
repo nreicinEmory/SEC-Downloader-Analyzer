@@ -64,7 +64,6 @@ streamlit run app.py
   - `semantic_processor.py`: Processes and analyzes filings
   - `fin_ratios.py`: Financial metrics and ratio calculations
   - `types.py`: Data structures and type definitions
-  - `parsing/`: HTML parsing utilities
 
 ## Dependencies
 
@@ -76,7 +75,8 @@ streamlit run app.py
   - `pandas` & `numpy`: Data manipulation
   - `plotly`: Interactive visualizations
   - `beautifulsoup4`: HTML parsing
-  - `PyYAML`: Configuration handling
+  - `textblob`: Sentiment analysis
+  - `nltk`: Natural language processing
 
 See requirements.txt for complete list of dependencies and versions.
 
