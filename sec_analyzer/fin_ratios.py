@@ -1,7 +1,6 @@
 from financetoolkit import Toolkit
 import pandas as pd
 
-API_KEY = "dGNRQtg75qUy2p1ONrPp47JT4xNd0FtW"
 
 def safe_get(df, key, alternative_keys=None):
     """Safely get a value from DataFrame with fallback keys."""
